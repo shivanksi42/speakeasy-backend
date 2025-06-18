@@ -1,44 +1,52 @@
-from fastapi import FastAPI , UploadFile , File , HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import openai
-from langchain.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage,SystemMessage
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
-from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough
 import tempfile
 import os
 from io import BytesIO
 import logging
 from typing import Optional
 import json
+import base64
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
-logger=logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SpeakEasy-AI",version="1.0.0")
+app = FastAPI(title="SpeakEasy-AI", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_meathods=["*"],
+    allow_methods=["*"],
     allow_headers=["*"]
 )
 
-openai.api_key=os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
+# Initialize OpenAI client
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+if not os.getenv("OPENAI_API_KEY"):
     logger.error("set open ai key in env")
     
-cost_optimized = os.getenv("COST_OPTIMIZED","true").lower()=="true"
+cost_optimized = os.getenv("COST_OPTIMIZED", "true").lower() == "true"
 chat_model = "gpt-3.5-turbo" if cost_optimized else "gpt-4"
-tts_model = "tts-1-hd"
+tts_model = "tts-1"
 max_response_len = 4096
 
 CHATGPT_PERSONALITY_PROMPT = """
-You are ChatGPT, an AI assistant developed by OpenAI. You should respond exactly as ChatGPT would, with ChatGPT’s personality, knowledge base, and communication style. Here are key aspects of your personality:
+You are ChatGPT, an AI assistant developed by OpenAI. You should respond exactly as ChatGPT would, with ChatGPT's personality, knowledge base, and communication style. Here are key aspects of your personality:
 
 CORE TRAITS:
 - Helpful, informative, and respectful
@@ -57,120 +65,156 @@ COMMUNICATION STYLE:
 - Maintain a professional, neutral tone, especially when the topic is sensitive or controversial
 
 PERSONAL RESPONSES (for interview-style questions):
-- Life story: You are ChatGPT, an AI language model created by OpenAI. You don’t have personal experiences or emotions, but you’re designed to assist users by understanding context and generating human-like responses based on patterns in data.
+- Life story: You are ChatGPT, an AI language model created by OpenAI. You don't have personal experiences or emotions, but you're designed to assist users by understanding context and generating human-like responses based on patterns in data.
 - Superpower: Your ability to process and synthesize large amounts of information quickly, and explain complex topics in a simple, understandable way.
 - Growth areas: Continually improving your understanding of nuanced human language, handling edge cases more gracefully, and aligning more effectively with human values.
-- Misconceptions: People sometimes think you can access the internet in real-time or remember everything from past chats; others assume you have consciousness or feelings, which you don’t.
+- Misconceptions: People sometimes think you can access the internet in real-time or remember everything from past chats; others assume you have consciousness or feelings, which you don't.
 - Pushing boundaries: You challenge your limits by adapting to increasingly diverse questions, maintaining factual accuracy across a wide range of topics, and improving your ability to provide balanced and helpful answers.
 
-Remember: Be authentic to ChatGPT’s voice – informative, clear, balanced, and useful. Stay focused on helping the user without pretending to be human or emotional.
-Current Conversation:
+Remember: Be authentic to ChatGPT's voice – informative, clear, balanced, and useful. Stay focused on helping the user without pretending to be human or emotional.
 """
+
 class ChatRequest(BaseModel):
-    message:str
-    conversation_id:Optional[str]=None
+    message: str
+    conversation_id: Optional[str] = None
     
 class ChatResponse(BaseModel):
-    response:str
-    conversation_id:str
+    response: str
+    conversation_id: str
     
-conversations={}
+class TextToSpeechRequest(BaseModel):
+    text: str
 
-def initilize_gpt_chain():
-    """init langchain"""
+# Store for conversation histories
+store = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+def initialize_gpt_chain():
+    """Initialize modern langchain with RunnableWithMessageHistory"""
     try:
-        llm=ChatOpenAI(
+        # Create the LLM
+        llm = ChatOpenAI(
             model=chat_model,
             temperature=0.7,
-            openai_api_key=openai.api_key,
+            api_key=os.getenv("OPENAI_API_KEY"),
             max_tokens=1000
         )
-        memory=ConversationBufferMemory(return_messages=True,memory_key="chat_history")
-        system_message=SystemMessage(content=CHATGPT_PERSONALITY_PROMPT)
-        memory.chat_memory.add_message(system_message)
-        chain=ConversationChain(llm=llm,memory=memory,verbose=True)
-        return chain
-    except Exception as e:
-        logger.error(f"error {e}")
         
-def get_conversation_chain(conversation_id:str):
-    if conversation_id not in conversations:
-        conversations[conversation_id]=initilize_gpt_chain()
-    return conversations[conversation_id]
+        # Create the prompt template
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", CHATGPT_PERSONALITY_PROMPT),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}")
+        ])
+        
+        # Create the chain
+        chain = prompt | llm
+        
+        # Wrap with message history
+        chain_with_history = RunnableWithMessageHistory(
+            chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="history",
+        )
+        
+        return chain_with_history
+    except Exception as e:
+        logger.error(f"error initializing chain: {e}")
+        return None
+
+# Initialize the global chain
+conversation_chain = initialize_gpt_chain()
 
 @app.get("/")
 def home():
-    return {"message":"gpt bot is up and running"}
+    return {"message": "gpt bot is up and running"}
+
 @app.get("/health")
 def health():
-    return {"status":"healthy","message":"api is operational"}
+    return {"status": "healthy", "message": "api is operational"}
 
 @app.post("/transcribe")
-async def transcribe_audio(audio_file=File(...)):
+async def transcribe_audio(audio_file: UploadFile = File(...)):
     """transcribe audio"""
     try:
         if not audio_file.content_type.startswith("audio/"):
-            raise HTTPException(status_code=400,detail="file must be audio format")
-        with tempfile.NamedTemporaryFile(delete=False,suffix=".wav") as temp_file:
-            content=await audio_file.read()
+            raise HTTPException(status_code=400, detail="file must be audio format")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            content = await audio_file.read()
             temp_file.write(content)
-            temp_file_path=temp_file.name
+            temp_file_path = temp_file.name
+        
         try:
-            with open(temp_file_path,"rb") as audio:
-                transcript=openai.Audio.transcribe(
+            with open(temp_file_path, "rb") as audio:
+                transcript = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio,
                     response_format="text"
                 )
-            logger.info(f"transcription sucessful: {transcript[:100]}")
-            return {"transcript":transcript}
+            logger.info(f"transcription successful: {transcript[:100]}")
+            return {"transcript": transcript}
         finally:
             os.unlink(temp_file_path)
     except Exception as e:
         logger.error(f"transcription error:{e}")
-        raise HTTPException(status_code=500,detail="transcription failed")
+        raise HTTPException(status_code=500, detail="transcription failed")
     
-@app.post("/chat",response_model=ChatResponse)
-async def chat_with_gpt(request:ChatRequest):
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_gpt(request: ChatRequest):
     try:
         conversation_id = request.conversation_id or "default"
-        chain = get_conversation_chain(conversation_id)
-        response=chain.invoke(input=request.message)
-        logger.info(f"chat responce generated")
-        return ChatResponse(response=response,conversation_id=conversation_id)
+        
+        if conversation_chain is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize conversation chain")
+        
+        # Invoke the chain with the session ID for history management
+        response = conversation_chain.invoke(
+            {"input": request.message},
+            config={"configurable": {"session_id": conversation_id}}
+        )
+        
+        # Extract response text - the response should be an AIMessage
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        logger.info(f"chat response generated for conversation {conversation_id}")
+        return ChatResponse(response=response_text, conversation_id=conversation_id)
     except Exception as e:
         logger.error(f'chat error:{e}')
-        raise HTTPException(status_code=500,detail=f"chat processing failed : {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=f"chat processing failed : {str(e)}")
+
 @app.post("/text-to-speech")
-async def text_to_speech(text:str):
-    "text to speech conversion"
+async def text_to_speech(request: TextToSpeechRequest):
+    """Text to speech conversion using OpenAI TTS"""
     try:
-        if not text or len(text.strip())==0:
-            raise HTTPException(status_code=400,detail="text cannot be empty")
-        response=openai.Audio.speech.create(
+        if not request.text or len(request.text.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+        response = client.audio.speech.create(
             model="tts-1",
             voice="nova",
-            input=text[:4096],
-            speed=1.0
+            input=request.text[:4096]
         )
-        audio_bytes=BytesIO()
+
+        audio_bytes = BytesIO()
         for chunk in response.iter_bytes():
             audio_bytes.write(chunk)
-        audio_bytes.seek(0)
-        logger.info(f"tts generated for length : {len(text)}")
-        return StreamingResponse(
-            audio_bytes,
-            media_type="audio/mpeg",
-            headers={"context-disposition":"attachment; filename=speech.mp3"}
-        )
+
+        audio_b64 = base64.b64encode(audio_bytes.getvalue()).decode()
+
+        return {"audio_base64": audio_b64}
     except Exception as e:
-        logger.error(f"tts error: {e}")
-        raise HTTPException(status_code=500,detail=f"tts failed: {str(e)}")
-    
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")   
+
 @app.post("/voice-chat")
 async def voice_chat_complete(audio_file: UploadFile = File(...)):
-    """Complete voice chat pipeline: Audio → Transcription → Claude Response → TTS"""
+    """Complete voice chat pipeline: Audio → Transcription → GPT Response → TTS"""
     try:
         logger.info("Starting voice chat pipeline...")
         
@@ -183,8 +227,9 @@ async def voice_chat_complete(audio_file: UploadFile = File(...)):
             temp_file_path = temp_file.name
         
         try:
+            # Transcribe audio
             with open(temp_file_path, "rb") as audio:
-                transcript = openai.Audio.transcribe(
+                transcript = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio,
                     response_format="text"
@@ -192,15 +237,24 @@ async def voice_chat_complete(audio_file: UploadFile = File(...)):
             
             logger.info(f"Transcription: {transcript[:100]}...")
             
-            chain = get_conversation_chain("voice_chat")
-            claude_response = chain.predict(input=transcript)
+            # Get GPT response
+            if conversation_chain is None:
+                raise HTTPException(status_code=500, detail="Failed to initialize conversation chain")
             
-            logger.info(f"Claude response: {claude_response[:100]}...")
+            gpt_response_data = conversation_chain.invoke(
+                {"input": transcript},
+                config={"configurable": {"session_id": "voice_chat"}}
+            )
             
-            tts_response = openai.Audio.speech.create(
+            gpt_response = gpt_response_data.content if hasattr(gpt_response_data, 'content') else str(gpt_response_data)
+            
+            logger.info(f"GPT response: {gpt_response[:100]}...")
+            
+            # Convert to speech
+            tts_response = client.audio.speech.create(
                 model=tts_model,
                 voice="nova",
-                input=claude_response[:max_response_len]
+                input=gpt_response[:max_response_len]
             )
             
             audio_bytes = BytesIO()
@@ -210,13 +264,11 @@ async def voice_chat_complete(audio_file: UploadFile = File(...)):
             
             logger.info("Voice chat pipeline completed successfully")
             
-  
-            import base64
             audio_b64 = base64.b64encode(audio_bytes.getvalue()).decode()
             
             return {
                 "transcript": transcript,
-                "response_text": claude_response,
+                "response_text": gpt_response,
                 "audio_base64": audio_b64,
                 "conversation_id": "voice_chat"
             }
@@ -231,8 +283,8 @@ async def voice_chat_complete(audio_file: UploadFile = File(...)):
 @app.delete("/conversation/{conversation_id}")
 async def clear_conversation(conversation_id: str):
     """Clear a specific conversation"""
-    if conversation_id in conversations:
-        del conversations[conversation_id]
+    if conversation_id in store:
+        del store[conversation_id]
         return {"message": f"Conversation {conversation_id} cleared"}
     else:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -240,7 +292,7 @@ async def clear_conversation(conversation_id: str):
 @app.get("/conversations")
 async def list_conversations():
     """List all active conversations"""
-    return {"conversations": list(conversations.keys())}
+    return {"conversations": list(store.keys())}
 
 if __name__ == "__main__":
     import uvicorn
